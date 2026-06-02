@@ -1,12 +1,14 @@
 # BOOM Queries And Plots
 
-Small pipeline for running BOOM LSST alert filters, saving candidate/object query products, and producing light-curve plots with LSST detections, LSST forced photometry, and ZTF crossmatch photometry.
+Small pipeline for running BOOM LSST alert filters, saving candidate/object query products, and producing light-curve plots with LSST detections, LSST forced photometry, and ZTF crossmatch photometry. BOOM credentials are needed, setup as environment variables.
 
 ## Setup
 
+Create and activate a conda environment, then install the required dependencies:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+conda create -n boom-queries
+conda activate boom-queries
 pip install -r requirements.txt
 export BOOM_USERNAME="your_boom_username_here"
 export BOOM_PASSWORD="your_boom_password_here"
