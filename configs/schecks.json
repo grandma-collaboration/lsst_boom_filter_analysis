@@ -1,0 +1,194 @@
+[
+  {
+    "$match": {
+      "$and": [
+        {
+          "candidate.shape_flag": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.apFlux_flag": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.centroid_flag": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.isDipole": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.forced_PsfFlux_flag": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.pixelFlags_interpolated": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.pixelFlags_cr": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.forced_PsfFlux_flag_edge": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.pixelFlags_bad": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.pixelFlags_saturated": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.pixelFlags_streakCenter": {
+            "$eq": false
+          }
+        },
+        {
+          "candidate.snr_psf": {
+            "$gte": 6
+          }
+        },
+        {
+          "candidate.magpsf": {
+            "$lt": 24
+          }
+        },
+        {
+          "candidate.psfFlux": {
+            "$gt": 0
+          }
+        },
+        {
+          "candidate.psfFlux_flag": {
+            "$eq": false
+          }
+        },
+        {
+          "properties.star": {
+            "$eq": false
+          }
+        },
+        {
+          "properties.stationary": {
+            "$eq": true
+          }
+        },
+        {
+          "properties.near_brightstar": {
+            "$eq": false
+          }
+        },
+        {
+          "properties.rock": {
+            "$eq": false
+          }
+        },
+        {
+          "$or": [
+            {
+              "coordinates.b": {
+                "$gte": 20
+              }
+            },
+            {
+              "coordinates.b": {
+                "$lte": -20
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "$project": {
+      "objectId": 1,
+      "candidate.jd": 1,
+      "candidate.shape_flag": 1,
+      "candidate.apFlux_flag": 1,
+      "candidate.centroid_flag": 1,
+      "candidate.isDipole": 1,
+      "candidate.forced_PsfFlux_flag": 1,
+      "candidate.pixelFlags_interpolated": 1,
+      "candidate.pixelFlags_cr": 1,
+      "candidate.forced_PsfFlux_flag_edge": 1,
+      "candidate.pixelFlags_bad": 1,
+      "candidate.pixelFlags_saturated": 1,
+      "candidate.pixelFlags_streakCenter": 1,
+      "candidate.snr_psf": 1,
+      "candidate.magpsf": 1,
+      "candidate.psfFlux": 1,
+      "candidate.psfFlux_flag": 1,
+      "properties.star": 1,
+      "properties.stationary": 1,
+      "properties.near_brightstar": 1,
+      "properties.rock": 1,
+      "coordinates.b": 1,
+      "prv_candidates": 1
+    }
+  },
+  {
+    "$addFields": {
+      "jd_min_prv": {
+        "$min": "$prv_candidates.jd"
+      }
+    }
+  },
+  {
+    "$match": {
+      "$expr": {
+        "$lte": [
+          {
+            "$subtract": [
+              "$candidate.jd",
+              "$jd_min_prv"
+            ]
+          },
+          20
+        ]
+      }
+    }
+  },
+  {
+    "$project": {
+      "objectId": 1,
+      "candidate.jd": 1,
+      "candidate.shape_flag": 1,
+      "candidate.apFlux_flag": 1,
+      "candidate.centroid_flag": 1,
+      "candidate.isDipole": 1,
+      "candidate.forced_PsfFlux_flag": 1,
+      "candidate.pixelFlags_interpolated": 1,
+      "candidate.pixelFlags_cr": 1,
+      "candidate.forced_PsfFlux_flag_edge": 1,
+      "candidate.pixelFlags_bad": 1,
+      "candidate.pixelFlags_saturated": 1,
+      "candidate.pixelFlags_streakCenter": 1,
+      "candidate.snr_psf": 1,
+      "candidate.magpsf": 1,
+      "candidate.psfFlux": 1,
+      "candidate.psfFlux_flag": 1,
+      "properties.star": 1,
+      "properties.stationary": 1,
+      "properties.near_brightstar": 1,
+      "properties.rock": 1,
+      "coordinates.b": 1,
+      "prv_candidates": 1,
+      "jd_min_prv": 1
+    }
+  }
+]
