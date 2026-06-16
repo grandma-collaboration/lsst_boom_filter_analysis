@@ -212,6 +212,38 @@ def make_run_dir(output_dir, start_time, end_time):
     return run_dir
 
 
+def build_query_intervals(start_dt, end_dt, exclude_start_dt=None, exclude_end_dt=None):
+    if exclude_start_dt is None and exclude_end_dt is None:
+        return [(start_dt, end_dt)]
+
+    if exclude_start_dt is None or exclude_end_dt is None:
+        raise ValueError("exclude_start_time and exclude_end_time must be provided together")
+
+    if exclude_end_dt <= exclude_start_dt:
+        raise ValueError("exclude_end_time must be after exclude_start_time")
+
+    if exclude_end_dt <= start_dt or exclude_start_dt >= end_dt:
+        return [(start_dt, end_dt)]
+
+    intervals = []
+    if exclude_start_dt > start_dt:
+        intervals.append((start_dt, min(exclude_start_dt, end_dt)))
+    if exclude_end_dt < end_dt:
+        intervals.append((max(exclude_end_dt, start_dt), end_dt))
+
+    if not intervals:
+        raise ValueError("Excluded time range removes the entire query interval")
+
+    return intervals
+
+
+def interval_to_dict(start_dt, end_dt):
+    return {
+        "start_time": start_dt.isoformat(),
+        "end_time": end_dt.isoformat(),
+    }
+
+
 
 def as_list(value):
     if isinstance(value, list):
@@ -398,13 +430,21 @@ def write_object_summary(rows, fieldnames, output_csv):
 
 
 
-def main(output_dir, filter_file, start_time, end_time):
+def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None, exclude_end_time=None):
 
     print("Auth...")
     token, _ = get_token()
 
     start_dt = Time(start_time, scale='utc').to_datetime()
     end_dt = Time(end_time, scale='utc').to_datetime()
+    exclude_start_dt = Time(exclude_start_time, scale='utc').to_datetime() if exclude_start_time else None
+    exclude_end_dt = Time(exclude_end_time, scale='utc').to_datetime() if exclude_end_time else None
+    query_intervals = build_query_intervals(
+        start_dt,
+        end_dt,
+        exclude_start_dt=exclude_start_dt,
+        exclude_end_dt=exclude_end_dt,
+    )
 
     all_alerts = []
 
@@ -413,27 +453,31 @@ def main(output_dir, filter_file, start_time, end_time):
     print(f"Loaded pipeline with {len(pipeline)} stages")
 
     print("Running LSST filter in 1-day batches...\n")
+    if exclude_start_time and exclude_end_time:
+        print(f"Excluding time range: {exclude_start_time} to {exclude_end_time}")
 
-    current = start_dt
+    for interval_start, interval_end in query_intervals:
+        print(f"Included query interval: {interval_start.isoformat()} to {interval_end.isoformat()}")
+        current = interval_start
 
-    while current < end_dt:
-        next_day = min(current + timedelta(days=1), end_dt)
+        while current < interval_end:
+            next_day = min(current + timedelta(days=1), interval_end)
 
-        start_iso = current.isoformat()
-        end_iso = next_day.isoformat()
+            start_iso = current.isoformat()
+            end_iso = next_day.isoformat()
 
-        print(f"Querying: {start_iso} to {end_iso}")
+            print(f"Querying: {start_iso} to {end_iso}")
 
-        result = run_filter(token, pipeline, start_iso, end_iso)
-        alerts = result.get("data", {}).get("results", [])
+            result = run_filter(token, pipeline, start_iso, end_iso)
+            alerts = result.get("data", {}).get("results", [])
 
-        print(f"  fetched {len(alerts)} alerts")
-        if len(alerts) >= 10000:
-            print("  WARNING: fetched 10000 alerts; the BOOM query limit may have truncated this batch.")
+            print(f"  fetched {len(alerts)} alerts")
+            if len(alerts) >= 10000:
+                print("  WARNING: fetched 10000 alerts; the BOOM query limit may have truncated this batch.")
 
-        all_alerts.extend(alerts)
+            all_alerts.extend(alerts)
 
-        current = next_day
+            current = next_day
 
     print(f"\n                  Total alerts collected: {len(all_alerts)}")
 
@@ -490,6 +534,12 @@ def main(output_dir, filter_file, start_time, end_time):
         "n_alerts": len(all_alerts),
         "n_candidates": len(id_list),
         "n_objects": len(objectid_list),
+        "exclude_start_time": exclude_start_time,
+        "exclude_end_time": exclude_end_time,
+        "query_intervals": [
+            interval_to_dict(interval_start, interval_end)
+            for interval_start, interval_end in query_intervals
+        ],
     }
 
 
@@ -502,6 +552,8 @@ if __name__ == "__main__":
     parser.add_argument("--filter_file", required=True, help="Path to MongoDB pipeline JSON file")
     parser.add_argument("--start_time", required=True, help="ISO time")
     parser.add_argument("--end_time", required=True, help="ISO time")
+    parser.add_argument("--exclude_start_time", default=None, help="Optional ISO start time to exclude from the query")
+    parser.add_argument("--exclude_end_time", default=None, help="Optional ISO end time to exclude from the query")
 
     args = parser.parse_args()
 
@@ -509,5 +561,7 @@ if __name__ == "__main__":
         args.output_dir,
         args.filter_file,
         args.start_time,
-        args.end_time
+        args.end_time,
+        exclude_start_time=args.exclude_start_time,
+        exclude_end_time=args.exclude_end_time,
     )

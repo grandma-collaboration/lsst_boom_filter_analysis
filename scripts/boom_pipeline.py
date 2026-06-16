@@ -12,8 +12,14 @@ Example:
   python3 boom_pipeline.py \
     --output_dir ../boom_filter_outputs \
     --filter_file ../filters/my_filter.json \
-    --start_time 2026-03-01T12:00:00 \
-    --end_time 2026-05-13T12:00:00
+    --start_time 2025-09-01T12:00:00 \
+    --end_time 2026-02-18T12:00:00
+
+  python3 boom_pipeline.py \
+    --output_dir ../boom_filter_outputs \
+    --filter_file ../filters/my_filter.json \
+    --start_time 2026-02-27T12:00:00 \
+    --end_time 2026-06-10T12:00:00
 """
 
 from __future__ import annotations
@@ -47,6 +53,30 @@ def validate_time_range(start_time: str, end_time: str) -> None:
         raise ValueError(f"end_time must be after start_time ({start_time} >= {end_time})")
 
 
+def validate_exclude_time_range(
+    start_time: str,
+    end_time: str,
+    exclude_start_time: str | None,
+    exclude_end_time: str | None,
+) -> None:
+    if exclude_start_time is None and exclude_end_time is None:
+        return
+
+    if exclude_start_time is None or exclude_end_time is None:
+        raise ValueError("exclude_start_time and exclude_end_time must be provided together")
+
+    start = Time(start_time, scale="utc")
+    end = Time(end_time, scale="utc")
+    exclude_start = Time(exclude_start_time, scale="utc")
+    exclude_end = Time(exclude_end_time, scale="utc")
+
+    if exclude_end <= exclude_start:
+        raise ValueError("exclude_end_time must be after exclude_start_time")
+
+    if exclude_start <= start and exclude_end >= end:
+        raise ValueError("Excluded time range removes the entire query interval")
+
+
 def validate_relative_subdir(value: str, label: str) -> str:
     cleaned = value.strip().strip("/\\") or "plots"
     path = Path(cleaned)
@@ -71,6 +101,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     filter_file = resolve_existing_file(args.filter_file, "Filter file")
     validate_time_range(args.start_time, args.end_time)
+    validate_exclude_time_range(
+        args.start_time,
+        args.end_time,
+        args.exclude_start_time,
+        args.exclude_end_time,
+    )
     if args.max_objects is not None and args.max_objects < 1:
         raise ValueError("max_objects must be a positive integer")
 
@@ -80,6 +116,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     # Imported after validation so command-line errors stay clear and fast.
     import boom_filter_per_run
     import plot_lc
+    import population_plots
+    import run_summary
 
     print("\n========== BOOM filter ==========")
     filter_result = boom_filter_per_run.main(
@@ -87,12 +125,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         str(filter_file),
         args.start_time,
         args.end_time,
+        exclude_start_time=args.exclude_start_time,
+        exclude_end_time=args.exclude_end_time,
     )
 
     run_dir = Path(filter_result["run_dir"])
     plots_subdir = validate_relative_subdir(args.plots_subdir, "plots_subdir")
 
-    print("\n========== Light-curve plots ==========")
+    if args.skip_individual_plots:
+        print("\n========== LSST-only light-curve metrics ==========")
+    else:
+        print("\n========== Light-curve plots ==========")
     plot_result = plot_lc.main(
         filter_result["objects_json"],
         filter_result["candidates_json"],
@@ -101,6 +144,23 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         include_fp=not args.no_forced_photometry,
         output_subdir=plots_subdir,
         max_objects=args.max_objects,
+        make_plots=not args.skip_individual_plots,
+    )
+
+    print("\n========== Population plots ==========")
+    population_plot_result = population_plots.main(
+        plot_result["delta_metrics_csv"],
+        str(run_dir),
+        output_subdir="pop_plots",
+    )
+
+    print("\n========== Query summary ==========")
+    summary_result = run_summary.main(
+        filter_result["objects_summary"],
+        str(run_dir),
+        n_candidates=filter_result["n_candidates"],
+        n_objects=filter_result["n_objects"],
+        delta_metrics_csv=plot_result["delta_metrics_csv"],
     )
 
     manifest = {
@@ -110,12 +170,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "filter_file": str(filter_file),
             "start_time": args.start_time,
             "end_time": args.end_time,
+            "exclude_start_time": args.exclude_start_time,
+            "exclude_end_time": args.exclude_end_time,
             "include_ztf": not args.no_ztf,
             "include_forced_photometry": not args.no_forced_photometry,
             "max_objects": args.max_objects,
+            "skip_individual_plots": args.skip_individual_plots,
         },
         "filter_result": filter_result,
         "plot_result": plot_result,
+        "population_plot_result": population_plot_result,
+        "summary_result": summary_result,
         "artifacts": {
             "run_dir": str(run_dir),
             "candidates_json": filter_result["candidates_json"],
@@ -123,6 +188,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "candidates_summary_csv": filter_result["candidates_summary"],
             "objects_summary_csv": filter_result["objects_summary"],
             "plots_dir": plot_result["plots_dir"],
+            "delta_metrics_csv": plot_result["delta_metrics_csv"],
+            "pop_plots_dir": population_plot_result["pop_plots_dir"],
+            "delta_distribution_plot": population_plot_result["delta_distribution_plot"],
+            "highlighted_fraction_by_band_plot": population_plot_result["highlighted_fraction_by_band_plot"],
+            "highlighted_fraction_global_plot": population_plot_result["highlighted_fraction_global_plot"],
+            "lsst_points_by_band_plot": population_plot_result["lsst_points_by_band_plot"],
+            "lsst_points_global_plot": population_plot_result["lsst_points_global_plot"],
+            "query_summary_markdown": summary_result["query_summary_markdown"],
             "manifest": str(run_dir / "pipeline_manifest.json"),
         },
     }
@@ -145,6 +218,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start_time", required=True, help="UTC ISO start time")
     parser.add_argument("--end_time", required=True, help="UTC ISO end time")
     parser.add_argument(
+        "--exclude_start_time",
+        default=None,
+        help="Optional UTC ISO start time of a range to exclude from BOOM filtering.",
+    )
+    parser.add_argument(
+        "--exclude_end_time",
+        default=None,
+        help="Optional UTC ISO end time of a range to exclude from BOOM filtering.",
+    )
+    parser.add_argument(
         "--plots_subdir",
         default="plots",
         help="Subdirectory inside the run folder where plots are written.",
@@ -164,6 +247,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional cap on the number of objects to plot, useful for smoke tests.",
+    )
+    parser.add_argument(
+        "--skip_individual_plots",
+        action="store_true",
+        help="Skip individual light-curve PNG/pickle plots while still writing LSST-only metrics, population plots, and summaries.",
     )
     return parser
 
@@ -186,6 +274,14 @@ def main() -> int:
     print(f"Object JSON:            {artifacts['objects_json']}")
     print(f"Object summary CSV:     {artifacts['objects_summary_csv']}")
     print(f"Plots directory:        {artifacts['plots_dir']}")
+    print(f"Delta metrics CSV:      {artifacts['delta_metrics_csv']}")
+    print(f"Population plots dir:   {artifacts['pop_plots_dir']}")
+    print(f"Time range distribution:{artifacts['delta_distribution_plot']}")
+    print(f"Band fraction plot:     {artifacts['highlighted_fraction_by_band_plot']}")
+    print(f"Global fraction plot:   {artifacts['highlighted_fraction_global_plot']}")
+    print(f"Band LSST count plot:   {artifacts['lsst_points_by_band_plot']}")
+    print(f"Global LSST count plot: {artifacts['lsst_points_global_plot']}")
+    print(f"Query summary:          {artifacts['query_summary_markdown']}")
     print(f"Manifest:               {artifacts['manifest']}")
     return 0
 

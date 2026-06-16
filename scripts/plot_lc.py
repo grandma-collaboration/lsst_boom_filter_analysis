@@ -2,6 +2,8 @@ import json
 import os
 import argparse
 import requests
+import csv
+import pickle
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -65,9 +67,63 @@ def get_token():
 # =========================
 # DATA LOADING
 # =========================
+def save_figure(fig, output_path):
+    fig.savefig(output_path)
+    pickle_path = os.path.splitext(output_path)[0] + ".pickle"
+    with open(pickle_path, "wb") as f:
+        pickle.dump(fig, f)
+    return pickle_path
+
+
 def load_json(file_path):
     with open(file_path, "r") as f:
         return json.load(f)
+
+
+def empty_delta_metric(obj_id, status):
+    metric = {
+        "objectId": obj_id,
+        "delta": None,
+        "delta_status": status,
+        "n_highlighted_points": 0,
+        "n_total_points": 0,
+        "highlighted_fraction": None,
+        "baseline_days": None,
+        "highlighted_window_days": None,
+        "highlighted_start_day": None,
+        "highlighted_stop_day": None,
+    }
+    for band in BANDS:
+        metric[f"n_highlighted_points_{band}"] = 0
+        metric[f"n_total_points_{band}"] = 0
+        metric[f"highlighted_fraction_{band}"] = None
+    return metric
+
+
+def write_delta_metrics(metrics, output_csv):
+    fieldnames = [
+        "objectId",
+        "delta",
+        "delta_status",
+        "n_highlighted_points",
+        "n_total_points",
+        "highlighted_fraction",
+        "baseline_days",
+        "highlighted_window_days",
+        "highlighted_start_day",
+        "highlighted_stop_day",
+    ]
+    for band in BANDS:
+        fieldnames.extend([
+            f"n_highlighted_points_{band}",
+            f"n_total_points_{band}",
+            f"highlighted_fraction_{band}",
+        ])
+
+    with open(output_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics)
 
 
 def first_valid_coordinates(points):
@@ -236,11 +292,92 @@ def is_valid_ulim(p):
 
     return (bool_jd and bool_lim and bool_band)
 
+
+def compute_object_metrics(obj, alert_points_passed):
+    obj_id = obj.get("_id", obj.get("objectId"))
+    lc_points = obj.get("prv_candidates", [])
+
+    points_by_band = defaultdict(list)
+    for p in lc_points:
+        if p.get("band") is not None and p.get("jd") is not None and p.get("magpsf") is not None:
+            points_by_band[p["band"]].append(p)
+
+    all_lsst_jds = [p["jd"] for points in points_by_band.values() for p in points]
+    if not all_lsst_jds:
+        return empty_delta_metric(obj_id, "no_valid_lsst_photometry")
+
+    jd_min = min(all_lsst_jds)
+    baseline = max(all_lsst_jds) - jd_min
+
+    n_total_points_by_band = {band: 0 for band in BANDS}
+    n_highlighted_points_by_band = {band: 0 for band in BANDS}
+    all_highlighted_x = []
+
+    for band in BANDS:
+        band_points = points_by_band.get(band, [])
+        band_points.sort(key=lambda point: point["jd"])
+
+        highlights = [
+            is_highlight(band, p["jd"], alert_points_passed[obj_id])
+            for p in band_points
+        ]
+        x_high = [
+            p["jd"] - jd_min
+            for p, highlight in zip(band_points, highlights)
+            if highlight
+        ]
+
+        n_total_points_by_band[band] = len(band_points)
+        n_highlighted_points_by_band[band] = sum(highlights)
+        all_highlighted_x.extend(x_high)
+
+    highlighted_window = None
+    highlighted_window_days = None
+    delta_status = "no_highlights"
+    object_delta = 0
+    if len(all_highlighted_x) >= 2 and baseline > 0:
+        highlighted_window = (min(all_highlighted_x), max(all_highlighted_x))
+        highlighted_window_days = highlighted_window[1] - highlighted_window[0]
+        object_delta = highlighted_window_days / baseline
+        delta_status = "used"
+    elif len(all_highlighted_x) == 1:
+        delta_status = "single_point"
+    elif len(all_highlighted_x) >= 2:
+        delta_status = "zero_baseline"
+
+    n_total_points = sum(n_total_points_by_band.values())
+    highlighted_count = sum(n_highlighted_points_by_band.values())
+    highlighted_fraction = highlighted_count / n_total_points if n_total_points > 0 else None
+
+    metric = {
+        "objectId": obj_id,
+        "delta": object_delta if delta_status == "used" else None,
+        "delta_status": delta_status,
+        "n_highlighted_points": highlighted_count,
+        "n_total_points": n_total_points,
+        "highlighted_fraction": highlighted_fraction,
+        "baseline_days": baseline,
+        "highlighted_window_days": highlighted_window_days,
+        "highlighted_start_day": highlighted_window[0] if highlighted_window is not None else None,
+        "highlighted_stop_day": highlighted_window[1] if highlighted_window is not None else None,
+    }
+    for band in BANDS:
+        n_total_band = n_total_points_by_band[band]
+        n_highlighted_band = n_highlighted_points_by_band[band]
+        metric[f"n_highlighted_points_{band}"] = n_highlighted_band
+        metric[f"n_total_points_{band}"] = n_total_band
+        metric[f"highlighted_fraction_{band}"] = (
+            n_highlighted_band / n_total_band if n_total_band > 0 else None
+        )
+
+    return metric
+
 # =========================
 # LIGHT CURVE PLOTTING
 # =========================
 def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
     obj_id = obj.get("_id", obj.get("objectId"))
+    metric = compute_object_metrics(obj, alert_points_passed)
 
     print(f"\n\n\n      ========================== Object {obj_id} ({iter+1}) ==========================\n")
 
@@ -263,7 +400,7 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
 
     if not lc_points and not lc_point_fp and not lc_points_ztf:
         print("No plottable photometry for this object")
-        return 0
+        return empty_delta_metric(obj_id, "no_photometry")
 
     # Organize points by band
     points_by_band = defaultdict(list)
@@ -291,7 +428,7 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
     )
     if not all_plot_jds:
         print("No valid photometry survived quality cuts for this object")
-        return 0
+        return empty_delta_metric(obj_id, "no_valid_photometry")
 
     jd_min = min(all_plot_jds)
     jd_min_iso = Time(jd_min, format='jd', scale='utc').to_datetime()
@@ -300,10 +437,12 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
     fig, axes = plt.subplots(3, 2, sharex=True, figsize=(12, 8))
     axes = axes.flatten()
 
-    delta_list = [0 for band in BANDS]
     x_min, x_max = 1e30, 0
 
     highlighted_count = 0
+    all_highlighted_x = []
+    n_total_points_by_band = {band: 0 for band in BANDS}
+    n_highlighted_points_by_band = {band: 0 for band in BANDS}
 
     for i, band in enumerate(BANDS):
         ax = axes[i]
@@ -365,7 +504,10 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
         highlights = [is_highlight(band, p["jd"], alert_points_passed[obj_id]) for p in band_points]
 
         # Updating the count of highlighted points
-        highlighted_count += sum(highlights)
+        n_highlighted_band = sum(highlights)
+        n_total_points_by_band[band] = len(band_points)
+        n_highlighted_points_by_band[band] = n_highlighted_band
+        highlighted_count += n_highlighted_band
 
         # ========================================
         #      Plotting the light curves
@@ -400,50 +542,79 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
         y_high = [yy for yy, h in zip(y, highlights) if h]
         yerr_high = [ee for ee, h in zip(yerr, highlights) if h]
 
-        delta = 0
-
         if x_high:
+            all_highlighted_x.extend(x_high)
             ax.errorbar(x_high, y_high, yerr=yerr_high, fmt='o', color='black', markersize=8, markeredgecolor='yellow', markeredgewidth=1.5, label='Passed filter')
-        
-            # Shade the window that passed the cuts
-
-            jd_start_rel = x_high[0]
-            jd_stop_rel = x_high[-1]
-
-            if len(x_high) >= 2:
-                delta = (jd_stop_rel - jd_start_rel)
-                ax.axvspan(jd_start_rel, jd_stop_rel, color="gray", alpha=0.5, label="Period of interest $dt_i$")
 
         ax.invert_yaxis()
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(loc='upper right')
-        delta_list[i] = delta
     
     # Compute the overall period of interest ratio across all bands
     baseline = x_max - x_min
-    object_delta = max(delta_list) / baseline if baseline > 0 else 0
+    highlighted_window = None
+    highlighted_window_days = None
+    delta_status = "no_highlights"
+    if len(all_highlighted_x) >= 2 and baseline > 0:
+        highlighted_window = (min(all_highlighted_x), max(all_highlighted_x))
+        highlighted_window_days = highlighted_window[1] - highlighted_window[0]
+        object_delta = highlighted_window_days / baseline
+        delta_status = "used"
+    else:
+        object_delta = 0
+        if len(all_highlighted_x) == 1:
+            delta_status = "single_point"
+        elif len(all_highlighted_x) >= 2:
+            delta_status = "zero_baseline"
 
-    if object_delta > 0.1:
-        print(f"Significant period of interest: Delta = {object_delta:.2f}")
+    if highlighted_window is not None:
+        for i, ax in enumerate(axes):
+            label = "Time range of interest" if i == 0 else "_nolegend_"
+            ax.axvspan(highlighted_window[0], highlighted_window[1], color="gray", alpha=0.5, label=label)
 
-    if object_delta == 0:
-        object_delta = "single point"
+    for ax in axes:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc='upper right')
 
-    plt.suptitle(f"Light Curve for Object {obj_id} ({iter+1}), T0 = {jd_min_iso.strftime('%Y-%m-%d %H:%M:%S')} UTC, $\\Delta = {object_delta}$")
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    metric_delta = metric["delta"] if metric["delta"] is not None else 0
+    if metric_delta > 0.1:
+        print(f"Significant relative time range of interest: {metric_delta:.2f}")
+
+    title_time_range = metric_delta
+    if metric["delta_status"] == "single_point":
+        title_time_range = "single point"
+
+    n_total_points = metric["n_total_points"]
+    highlighted_count = metric["n_highlighted_points"]
+    highlighted_fraction = metric["highlighted_fraction"] or 0
+    plt.suptitle(
+        f"Light Curve for Object {obj_id} ({iter+1}), T0 = {jd_min_iso.strftime('%Y-%m-%d %H:%M:%S')} UTC, "
+        f"Rel. time range of interest = {title_time_range}\n"
+        f"Filter-passing LSST points: {highlighted_count}/{n_total_points} ({highlighted_fraction:.1%}); "
+        f"LSST detections: {n_total_points}"
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
     output_path = os.path.join(output_dir, f"lc_{iter+1}_object_{obj_id}.png")
-    plt.savefig(output_path)
+    pickle_path = save_figure(fig, output_path)
     plt.close(fig)
     print(f"\nSaved to {output_path}")
+    print(f"Saved figure pickle to {pickle_path}")
 
-    return highlighted_count
+    return metric
 
 
 # =========================
 # MAIN
 # =========================
-def main(objects_json_file, alerts_json_file, output_dir, include_ztf=None, include_fp=None, output_subdir=None, max_objects=None):
+def main(
+    objects_json_file,
+    alerts_json_file,
+    output_dir,
+    include_ztf=None,
+    include_fp=None,
+    output_subdir=None,
+    max_objects=None,
+    make_plots=True,
+):
     global INCLUDE_ZTF, INCLUDE_FP
 
     if include_ztf is not None:
@@ -453,7 +624,7 @@ def main(objects_json_file, alerts_json_file, output_dir, include_ztf=None, incl
 
     os.makedirs(output_dir, exist_ok=True)
     token = None
-    if INCLUDE_ZTF:
+    if make_plots and INCLUDE_ZTF:
         token, expires_at = get_token()
 
     highlight_count = 0
@@ -477,17 +648,29 @@ def main(objects_json_file, alerts_json_file, output_dir, include_ztf=None, incl
     if max_objects is not None:
         objects_data = objects_data[:max_objects]
 
+    delta_metrics = []
     for i, obj in enumerate(objects_data):
-        highlighted_count = plot_object_lc(token, obj, alert_points_passed, output_dir, i)
-        highlight_count += highlighted_count
+        if make_plots:
+            metric = plot_object_lc(token, obj, alert_points_passed, output_dir, i)
+        else:
+            metric = compute_object_metrics(obj, alert_points_passed)
+        delta_metrics.append(metric)
+        highlight_count += metric["n_highlighted_points"]
+
+    delta_metrics_csv = os.path.join(output_dir, "delta_metrics.csv")
+    write_delta_metrics(delta_metrics, delta_metrics_csv)
+    print(f"Saved delta metrics to {delta_metrics_csv}")
 
     print(f"Total highlighted points: {highlight_count}")
     return {
         "plots_dir": output_dir,
-        "n_objects_plotted": len(objects_data),
+        "delta_metrics_csv": delta_metrics_csv,
+        "n_objects_plotted": len(objects_data) if make_plots else 0,
+        "n_objects_with_metrics": len(objects_data),
         "n_highlighted_points": highlight_count,
         "include_ztf": INCLUDE_ZTF,
         "include_fp": INCLUDE_FP,
+        "make_plots": make_plots,
     }
 
 """
@@ -504,6 +687,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_fp", action="store_true", help="Do not include LSST forced photometry")
     parser.add_argument("--output_subdir", default=None, help="Optional plot subfolder name")
     parser.add_argument("--max_objects", type=int, default=None, help="Optional maximum number of objects to plot")
+    parser.add_argument("--skip_individual_plots", action="store_true", help="Only write LSST-only delta metrics; do not plot individual light curves")
     args = parser.parse_args()
 
     main(
@@ -514,4 +698,5 @@ if __name__ == "__main__":
         include_fp=not args.no_fp,
         output_subdir=args.output_subdir,
         max_objects=args.max_objects,
+        make_plots=not args.skip_individual_plots,
     )

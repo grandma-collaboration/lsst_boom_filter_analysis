@@ -32,7 +32,13 @@ Useful options:
 --no_ztf
 --no_forced_photometry
 --max_objects 10
+--exclude_start_time 2026-03-05T12:00:00
+--exclude_end_time 2026-03-08T12:00:00
+--skip_individual_plots
 ```
+
+Use `--exclude_start_time` and `--exclude_end_time` together to skip querying an interval inside the requested time range.
+Use `--skip_individual_plots` to skip per-object light-curve PNG/pickle files while still writing LSST-only metrics, population plots, and the markdown summary.
 
 ## Outputs
 
@@ -45,6 +51,14 @@ run_.../
   cands_sum.csv
   objs_sum.csv
   plots/
+    delta_metrics.csv
+  pop_plots/
+    delta_distribution.png
+    highlighted_fraction_by_band.png
+    highlighted_fraction_global.png
+    lsst_points_by_band.png
+    lsst_points_global.png
+  query_summary.md
   pipeline_manifest.json
 ```
 
