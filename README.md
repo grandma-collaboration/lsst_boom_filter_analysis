@@ -4,14 +4,20 @@ This repository contains a small analysis pipeline for running BOOM LSST alert
 filters, retrieving the matching candidates and objects, and producing
 light-curve and population-level diagnostic plots.
 
-The recommended entry point is `scripts/boom_pipeline.py`. In one command it:
+The recommended entry point is `scripts/boom_pipeline.py`, configured through
+`scripts/inputs.py`. In one run it:
 
-1. runs a BOOM filter over a requested UTC time range;
-2. downloads candidate and object query products;
-3. writes compact CSV summaries;
-4. computes per-object light-curve metrics;
-5. optionally writes individual light-curve PNG and pickle files;
-6. writes population-level plots and a markdown run summary.
+1. runs a BOOM filter over a requested UTC time range, optionally skipping one
+   excluded interval;
+2. downloads candidate and object query products, and drops the objects with
+   photometry in the excluded interval;
+3. optionally counts every LSST alert and object in the range, to report the
+   fraction passing the filter;
+4. fetches BOOM's latest rising/fading rate in each band for each object;
+5. writes compact CSV summaries;
+6. computes per-object light-curve metrics;
+7. optionally writes individual light-curve PNG and pickle files;
+8. writes population-level plots and a markdown run summary.
 
 BOOM credentials are required and are read from environment variables.
 
@@ -38,83 +44,115 @@ environment.
 
 ## Quick Start
 
-Run the full pipeline from the repository root:
+Edit `scripts/inputs.py` (set at least `FILTER_FILE`, `START_TIME` and
+`END_TIME`), then run the full pipeline from the repository root:
 
 ```bash
-python scripts/boom_pipeline.py \
-  --output_dir boom_filter_outputs \
-  --filter_file configs/schecks.json \
-  --start_time 2026-03-01T12:00:00 \
-  --end_time 2026-05-13T12:00:00
+python scripts/boom_pipeline.py
 ```
 
-By default, for individual lightcurve plots, the full pipeline includes LSST detections, LSST forced photometry,
-and ZTF cone-search crossmatch photometry when available. For population-level diagnostic plots, only the LSST detections are included.
+`scripts/boom_pipeline.py` has no command-line interface: every parameter is
+read from `scripts/inputs.py`, and any argument passed on the command line is
+ignored.
 
-## Main Pipeline Arguments
+With `INCLUDE_FORCED_PHOTOMETRY` and `INCLUDE_ZTF` set to `True`, as they are in
+`scripts/inputs.py`, individual lightcurve plots include LSST detections, LSST
+forced photometry, and ZTF cone-search crossmatch photometry when available. For
+population-level diagnostic plots, only the LSST detections are included.
 
-`scripts/boom_pipeline.py` is the main command to use for most runs.
+## Main Pipeline Parameters
 
-```bash
-python scripts/boom_pipeline.py \
-  --filter_file configs/schecks.json \
-  --start_time 2026-03-01T12:00:00 \
-  --end_time 2026-05-13T12:00:00
+`scripts/boom_pipeline.py` is the main command to use for most runs. All its
+parameters are defined in `scripts/inputs.py` and must stay defined there. A
+minimal configuration sets:
+
+```python
+FILTER_FILE = "configs/schecks.json"
+START_TIME = "2026-03-01T12:00:00"
+END_TIME = "2026-05-13T12:00:00"
 ```
 
-| Argument | Required | Default | Description |
+The optional parameters can be left at their typical value.
+
+| Parameter | Required | Typical value | Description |
 | --- | --- | --- | --- |
-| `--filter_file` | yes | none | Path to a JSON file containing a MongoDB aggregation pipeline. The file must contain a JSON list. |
-| `--start_time` | yes | none | UTC ISO start time for the BOOM filter query, for example `2026-03-01T12:00:00`. |
-| `--end_time` | yes | none | UTC ISO end time for the BOOM filter query. It must be later than `--start_time`. |
-| `--output_dir` | no | `boom_filter_outputs` | Base output directory. A timestamped run directory is created inside it. |
-| `--exclude_start_time` | no | `None` | UTC ISO start time of an interval to exclude from the BOOM query. Must be used with `--exclude_end_time`. |
-| `--exclude_end_time` | no | `None` | UTC ISO end time of an interval to exclude from the BOOM query. Must be used with `--exclude_start_time`. |
-| `--plots_subdir` | no | `plots` | Subdirectory inside the run directory where per-object plots and `delta_metrics.csv` are written. It must stay inside the run directory; absolute paths and `..` are rejected. |
-| `--no_ztf` | no | `False` | Disable ZTF cone-search crossmatch photometry in individual light-curve plots. Without this flag, ZTF photometry is included when available. |
-| `--no_forced_photometry` | no | `False` | Disable LSST forced photometry in individual light-curve plots. Without this flag, forced photometry is included. |
-| `--max_objects` | no | `None` | Limit the number of objects processed by the plotting and metric step. Useful for smoke tests. If provided, it must be a positive integer. |
-| `--skip_individual_plots` | no | `False` | Skip per-object light-curve PNG and pickle files. The pipeline still writes LSST-only `delta_metrics.csv`, population plots, query summary, and manifest. |
+| `FILTER_FILE` | yes | none | Path to a JSON file containing a MongoDB aggregation pipeline. The file must contain a JSON list. Relative paths are resolved from the current working directory. |
+| `START_TIME` | yes | none | UTC ISO start time for the BOOM filter query, for example `"2026-03-01T12:00:00"`. |
+| `END_TIME` | yes | none | UTC ISO end time for the BOOM filter query. It must be later than `START_TIME`. |
+| `OUTPUT_DIR` | no | `"boom_filter_outputs"` | Base output directory. A timestamped run directory is created inside it. |
+| `PLOTS_SUBDIR` | no | `"plots"` | Subdirectory inside the run directory where per-object plots and `delta_metrics.csv` are written. It must stay inside the run directory; absolute paths and `..` are rejected. |
+| `EXCLUDE_START_TIME` | no | `None` | UTC ISO start time of an interval to exclude from the run (see [Time Range Exclusion](#time-range-exclusion)). Must be set together with `EXCLUDE_END_TIME`. |
+| `EXCLUDE_END_TIME` | no | `None` | UTC ISO end time of the excluded interval. Must be set together with `EXCLUDE_START_TIME`. |
+| `MAX_OBJECTS` | no | `None` | Limit the number of objects processed by the plotting and metric step. Useful for smoke tests. If set, it must be a positive integer. |
+| `INCLUDE_ZTF` | no | `True` | Include ZTF cone-search crossmatch photometry in individual light-curve plots, when available. |
+| `INCLUDE_FORCED_PHOTOMETRY` | no | `True` | Include LSST forced photometry in individual light-curve plots. |
+| `SKIP_INDIVIDUAL_PLOTS` | no | `False` | Skip per-object light-curve PNG and pickle files. The pipeline still writes LSST-only `delta_metrics.csv`, population plots, query summary, and manifest. |
+| `COMPUTE_FILTER_PASS_RATES` | no | `False` | Also count every LSST alert and object in the queried range, to report the fraction passing the filter (see [Filter Pass Rates](#filter-pass-rates)). Adds about 2 minutes. |
 
 ### Time Range Exclusion
 
-Use `--exclude_start_time` and `--exclude_end_time` together to skip an interval
-inside the requested query range:
+Set `EXCLUDE_START_TIME` and `EXCLUDE_END_TIME` together in `scripts/inputs.py`
+to exclude an interval inside the requested query range:
 
-```bash
-python scripts/boom_pipeline.py \
-  --filter_file configs/schecks.json \
-  --start_time 2026-03-01T12:00:00 \
-  --end_time 2026-05-13T12:00:00 \
-  --exclude_start_time 2026-03-05T12:00:00 \
-  --exclude_end_time 2026-03-08T12:00:00
+```python
+EXCLUDE_START_TIME = "2026-03-05T12:00:00"
+EXCLUDE_END_TIME = "2026-03-08T12:00:00"
 ```
+
+The exclusion is applied in two steps:
+
+1. The BOOM filter is only run outside the interval, so no alert inside it can
+   pass the filter.
+2. After the objects are retrieved, every object with any point inside
+   `[EXCLUDE_START_TIME, EXCLUDE_END_TIME)` (LSST detection or forced
+   photometry, in any band) is dropped from the run, along with its candidates.
+   This includes forced-photometry measurements without a magnitude, which are
+   never plotted. Objects with no point inside the interval, including objects
+   with points on both sides of it, are kept with their full history.
+
+Everything downstream (JSON and CSV files, light-curve metrics, plots and
+summaries) only sees the objects that were kept. ZTF crossmatch photometry is
+not affected by the exclusion. On individual light-curve plots, the interval is
+shaded red where it overlaps the plotted time range.
 
 The exclusion interval must have an end time after its start time. It cannot
 remove the entire requested query interval. For now this is limited to only excluding one interval.
 
+### Filter Pass Rates
+
+With `COMPUTE_FILTER_PASS_RATES = True`, the pipeline also uses BOOM count
+queries to count:
+
+- every LSST alert detected in the queried range, minus the alerts inside the
+  excluded interval;
+- every LSST object with at least one detection in the queried range and no
+  point (detection or forced photometry) inside the excluded interval, which is
+  the same rule used to drop filter-passing objects.
+
+It prints the number of filter-passing alerts and objects as fractions of these
+totals, and saves them in `pipeline_manifest.json` under
+`filter_result.filter_pass_rates`. The object count scans the whole
+`LSST_alerts_aux` catalog, which takes about a minute.
+
+To match the alert total, the filter-passing alert count only leaves out the
+alerts inside the excluded interval (which the filter never sees), not the
+alerts of dropped objects. It can therefore be larger than the number of
+candidates in `cands.json`.
+
 ### Smoke Test Example
 
-This command runs the full query but only processes the first 10 objects during
-the plotting and metric step:
+To run the full query but only process the first 10 objects during the plotting
+and metric step, set in `scripts/inputs.py`:
 
-```bash
-python scripts/boom_pipeline.py \
-  --filter_file configs/schecks.json \
-  --start_time 2026-03-01T12:00:00 \
-  --end_time 2026-05-13T12:00:00 \
-  --max_objects 10
+```python
+MAX_OBJECTS = 10
 ```
 
 To quickly produce run-level metrics and population plots without individual
-light-curve image files:
+light-curve image files, set:
 
-```bash
-python scripts/boom_pipeline.py \
-  --filter_file configs/schecks.json \
-  --start_time 2026-03-01T12:00:00 \
-  --end_time 2026-05-13T12:00:00 \
-  --skip_individual_plots
+```python
+SKIP_INDIVIDUAL_PLOTS = True
 ```
 
 ## Filter Configurations
@@ -125,14 +163,15 @@ An example filter pipeline is stored in `configs/`:
 configs/schecks.json
 ```
 
-The .json file (--filter_file) is passed to BOOM as the `pipeline` field of the filter request. The
+The .json file (`FILTER_FILE`) is passed to BOOM as the `pipeline` field of the filter request. The
 pipeline runner queries BOOM in one-day batches and uses a request limit of
-`10000` alerts per batch. If a batch returns `10000` alerts, the script prints a
-warning because the result has been truncated by that limit.
+`10000` alerts per batch (`FILTER_QUERY_LIMIT` in
+`scripts/boom_filter_per_run.py`). If a batch returns `10000` alerts, the script
+prints a warning because the result may have been truncated by that limit.
 
 ## Outputs
 
-Each full pipeline run creates one timestamped folder under `--output_dir`:
+Each full pipeline run creates one timestamped folder under `OUTPUT_DIR`:
 
 ```text
 boom_filter_outputs/
@@ -141,6 +180,7 @@ boom_filter_outputs/
     objs.json
     cands_sum.csv
     objs_sum.csv
+    band_rates.json
     plots/
       lc_<n>_object_<objectId>.png
       lc_<n>_object_<objectId>.pickle
@@ -168,24 +208,30 @@ Important files:
   magnitude, and SNR.
 - `objs_sum.csv`: compact object table with photometry counts, time baselines,
   coordinates, magnitudes, SNRs, and per-band counts.
+- `band_rates.json`: BOOM's rising and fading rates for each object and band, as
+  of the object's most recent LSST detection in that band. They are shown in the
+  legend of individual light-curve plots.
 - `plots/delta_metrics.csv`: per-object metric table used to build the
   population plots.
 - `pop_plots/`: run-level diagnostic plots.
 - `query_summary.md`: markdown summary of retrieved candidates/objects and the
   number of objects with at least N filter-passing points.
-- `pipeline_manifest.json`: machine-readable record of command options and
-  generated artifact paths.
+- `pipeline_manifest.json`: machine-readable record of the parameters,
+  generated artifact paths and, when enabled, filter pass rates.
 
-See `docs/output_structure.md`.
+When an excluded interval is set, all of these files only describe the objects
+kept after the exclusion. See `docs/output_structure.md`.
 
 ## Standalone Scripts
 
-The full pipeline calls the scripts below internally. They can also be run
-separately when you want to rerun only one step.
+The full pipeline calls the scripts below internally. Unlike
+`boom_pipeline.py`, they take command-line arguments, and can be run separately
+when you want to rerun only one step.
 
 ### `scripts/boom_filter_per_run.py`
 
-Runs only the BOOM filter and writes candidate/object JSON plus CSV summaries.
+Runs only the BOOM filter and writes candidate/object JSON, `band_rates.json`,
+and CSV summaries.
 
 | Argument | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -193,8 +239,9 @@ Runs only the BOOM filter and writes candidate/object JSON plus CSV summaries.
 | `--start_time` | yes | none | ISO start time for the BOOM filter query. |
 | `--end_time` | yes | none | ISO end time for the BOOM filter query. |
 | `--output_dir` | no | `boom_filter_outputs` | Base output directory. A timestamped run folder is created inside it. |
-| `--exclude_start_time` | no | `None` | Optional ISO start time of an excluded query interval. |
-| `--exclude_end_time` | no | `None` | Optional ISO end time of an excluded query interval. |
+| `--exclude_start_time` | no | `None` | Optional ISO start time of the excluded interval. It is not queried, and objects with any point in it are dropped. |
+| `--exclude_end_time` | no | `None` | Optional ISO end time of the excluded interval. |
+| `--compute_pass_rates` | no | `False` | Also count every LSST alert and object in the range and report the filter pass fractions. |
 
 ### `scripts/plot_lc.py`
 
@@ -211,6 +258,9 @@ Plots light curves and writes `delta_metrics.csv` from existing `objs.json` and
 | `--output_subdir` | no | `None` | Optional plot subfolder name. If omitted, it is derived from the objects JSON filename. |
 | `--max_objects` | no | `None` | Optional maximum number of objects to process. |
 | `--skip_individual_plots` | no | `False` | Only write LSST-only delta metrics; do not write individual light-curve plots. |
+| `--exclude_start_time` | no | `None` | Optional UTC ISO start time of the run's excluded interval, only used to shade it on plots. Objects with points in it are dropped by `boom_filter_per_run.py`, not here. |
+| `--exclude_end_time` | no | `None` | Optional UTC ISO end time of the excluded interval. |
+| `--band_rates_json` | no | `None` | Optional path to `band_rates.json`, to show each band's rising/fading rate in the plot legends. |
 
 ### `scripts/population_plots.py`
 
@@ -238,6 +288,9 @@ Writes a markdown summary for one run.
 ## Notes
 
 - Do not commit BOOM credentials or generated run outputs.
-- `--no_ztf` on the full pipeline and `--include_ztf` on standalone
-  `plot_lc.py` differ because the full pipeline opts into ZTF by default, while
-  standalone plotting does not.
+- The full pipeline includes ZTF photometry according to `INCLUDE_ZTF` in
+  `scripts/inputs.py`, while standalone `plot_lc.py` only includes it with
+  `--include_ztf`.
+- Standalone `plot_lc.py` does not read the excluded interval or the band rates
+  from the run: pass `--exclude_start_time`/`--exclude_end_time` and
+  `--band_rates_json` to get the shading and the rate legend entries.

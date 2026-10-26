@@ -80,6 +80,34 @@ def load_json(file_path):
         return json.load(f)
 
 
+def make_exclude_jd(exclude_start_time, exclude_end_time):
+    """
+    Convert an optional UTC ISO exclusion interval to a (start_jd, end_jd) tuple.
+
+    Here it is only used to shade the interval on plots: the exclusion itself
+    is applied by boom_filter_per_run.py, which drops every object with a
+    point in it.
+    """
+    if exclude_start_time is None and exclude_end_time is None:
+        return None
+    if exclude_start_time is None or exclude_end_time is None:
+        raise ValueError("exclude_start_time and exclude_end_time must be provided together")
+    return (
+        Time(exclude_start_time, scale="utc").jd,
+        Time(exclude_end_time, scale="utc").jd,
+    )
+
+
+def in_excluded_interval(point, exclude_jd):
+    """
+    True if the point falls in the half-open excluded interval [start_jd, end_jd).
+    Not used in this file; imported by cleaned_population_plots.py.
+    """
+    if exclude_jd is None or point.get("jd") is None:
+        return False
+    return exclude_jd[0] <= point["jd"] < exclude_jd[1]
+
+
 def empty_delta_metric(obj_id, status):
     metric = {
         "objectId": obj_id,
@@ -272,6 +300,7 @@ def is_highlight(band, jd, passed_points, tol=1e-6):
             return True
     return False
 
+
 # ====================================
 # PHOTOMETRY QUALITY CHECK
 # ====================================
@@ -375,9 +404,10 @@ def compute_object_metrics(obj, alert_points_passed):
 # =========================
 # LIGHT CURVE PLOTTING
 # =========================
-def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
+def plot_object_lc(token, obj, alert_points_passed, output_dir, iter, exclude_jd=None, band_rates=None):
     obj_id = obj.get("_id", obj.get("objectId"))
     metric = compute_object_metrics(obj, alert_points_passed)
+    band_rates = band_rates or {}
 
     print(f"\n\n\n      ========================== Object {obj_id} ({iter+1}) ==========================\n")
 
@@ -407,13 +437,13 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
     for p in lc_points:
         if p.get("band") is not None and p.get("jd") is not None and p.get("magpsf") is not None:
             points_by_band[p["band"]].append(p)
-    
+
     points_by_band_fp = defaultdict(list)
     if INCLUDE_FP:
         for p in lc_point_fp:
             if is_valid_point(p):
                 points_by_band_fp[p["band"]].append(p)
-    
+
     points_by_band_ztf = defaultdict(list)
     if INCLUDE_ZTF:
         for p in lc_points_ztf:
@@ -454,6 +484,16 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
         ax.set_ylabel(f"{band}-band")
         if i >= 4:  # bottom row shows x-axis
             ax.set_xlabel("Age (days)")
+
+        # BOOM's latest rising/fading rate for this band, as invisible proxy
+        # artists so they show up in the legend even on an otherwise-empty panel
+        band_rate_info = band_rates.get(band, {})
+        rising_rate = band_rate_info.get("rising_rate")
+        fading_rate = band_rate_info.get("fading_rate")
+        if rising_rate is not None:
+            ax.plot([], [], ' ', label=f"Rising {rising_rate:.2f} mag/day")
+        if fading_rate is not None:
+            ax.plot([], [], ' ', label=f"Fading {fading_rate:.2f} mag/day")
 
         if not band_points and not band_points_fp and not band_points_ztf:
             continue
@@ -516,16 +556,16 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
         # Plot forced photometry points (if available)
         if INCLUDE_FP and x_fp:
             if all(yerr_fp):
-                ax.errorbar(x_fp, y_fp, yerr=yerr_fp, fmt='x', color=band_color, alpha=0.2, label='Forced photometry')
+                ax.errorbar(x_fp, y_fp, yerr=yerr_fp, fmt='x', color=band_color, alpha=0.2, label='fp')
             else:
-                ax.scatter(x_fp, y_fp, color=band_color, alpha=0.2, label='Forced photometry')
+                ax.scatter(x_fp, y_fp, color=band_color, alpha=0.2, label='fp')
 
         # Plot ZTF points (if available)
         if INCLUDE_ZTF and x_ztf:
             if all(yerr_ztf):
-                ax.errorbar(x_ztf, y_ztf, yerr=yerr_ztf, fmt='s', color='cyan', alpha=0.7, label='ZTF detections')
+                ax.errorbar(x_ztf, y_ztf, yerr=yerr_ztf, fmt='s', color='cyan', alpha=0.7, label='ZTF')
             else:
-                ax.scatter(x_ztf, y_ztf, color='cyan', alpha=0.7, label='ZTF detections')
+                ax.scatter(x_ztf, y_ztf, color='cyan', alpha=0.7, label='ZTF')
 
         # Plot normal LSST points
         x_norm = [xx for xx, h in zip(x, highlights) if not h]
@@ -570,6 +610,15 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
             label = "Time range of interest" if i == 0 else "_nolegend_"
             ax.axvspan(highlighted_window[0], highlighted_window[1], color="gray", alpha=0.5, label=label)
 
+    # Shade the excluded interval where it overlaps the plotted range
+    if exclude_jd is not None:
+        shade_lo = max(exclude_jd[0] - jd_min, x_min)
+        shade_hi = min(exclude_jd[1] - jd_min, x_max)
+        if shade_lo < shade_hi:
+            for i, ax in enumerate(axes):
+                label = "Excluded time range" if i == 0 else "_nolegend_"
+                ax.axvspan(shade_lo, shade_hi, color="red", alpha=0.1, label=label)
+
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()
         if handles:
@@ -586,11 +635,15 @@ def plot_object_lc(token, obj, alert_points_passed, output_dir, iter):
     n_total_points = metric["n_total_points"]
     highlighted_count = metric["n_highlighted_points"]
     highlighted_fraction = metric["highlighted_fraction"] or 0
+    if obj_ra is not None and obj_dec is not None:
+        coord_text = f"RA, Dec = {obj_ra:.4f}, {obj_dec:.4f}"
+    else:
+        coord_text = "RA, Dec = N/A"
     plt.suptitle(
         f"Light Curve for Object {obj_id} ({iter+1}), T0 = {jd_min_iso.strftime('%Y-%m-%d %H:%M:%S')} UTC, "
         f"Rel. time range of interest = {title_time_range}\n"
         f"Filter-passing LSST points: {highlighted_count}/{n_total_points} ({highlighted_fraction:.1%}); "
-        f"LSST detections: {n_total_points}"
+        f"{coord_text}"
     )
     plt.tight_layout(rect=[0, 0, 1, 0.92])
     output_path = os.path.join(output_dir, f"lc_{iter+1}_object_{obj_id}.png")
@@ -614,6 +667,9 @@ def main(
     output_subdir=None,
     max_objects=None,
     make_plots=True,
+    exclude_start_time=None,
+    exclude_end_time=None,
+    band_rates_json=None,
 ):
     global INCLUDE_ZTF, INCLUDE_FP
 
@@ -628,6 +684,7 @@ def main(
         token, expires_at = get_token()
 
     highlight_count = 0
+    exclude_jd = make_exclude_jd(exclude_start_time, exclude_end_time)
 
     # Output subfolder setup
     if output_subdir is None:
@@ -644,14 +701,24 @@ def main(
     # Alerts that passed the filter
     alert_points_passed = get_alert_points_passed(alerts_data)
 
+    # Per-object, per-band rising/fading rates, as of each band's most recent
+    # LSST detection (not just its most recent filter-passing one). Written by
+    # boom_filter_per_run.py alongside objs.json/cands.json, since the rate
+    # only exists on LSST_alerts documents and has to be queried separately.
+    rates_by_object = load_json(band_rates_json) if band_rates_json else {}
+
     # Plotting loop
     if max_objects is not None:
         objects_data = objects_data[:max_objects]
 
     delta_metrics = []
     for i, obj in enumerate(objects_data):
+        obj_id = obj.get("_id", obj.get("objectId"))
         if make_plots:
-            metric = plot_object_lc(token, obj, alert_points_passed, output_dir, i)
+            metric = plot_object_lc(
+                token, obj, alert_points_passed, output_dir, i,
+                exclude_jd=exclude_jd, band_rates=rates_by_object.get(obj_id, {}),
+            )
         else:
             metric = compute_object_metrics(obj, alert_points_passed)
         delta_metrics.append(metric)
@@ -671,11 +738,14 @@ def main(
         "include_ztf": INCLUDE_ZTF,
         "include_fp": INCLUDE_FP,
         "make_plots": make_plots,
+        "exclude_start_time": exclude_start_time,
+        "exclude_end_time": exclude_end_time,
+        "band_rates_json": band_rates_json,
     }
 
 """
 example command to run:
-python3 plot_lc.py --objects_json path/to/objects_jsons/objects_2026-02-26T12-00-00_to_2026-03-08T12-00-00.json --alerts_json path/to/candidate_jsons/candidates_2026-02-26T12-00-00_to_2026-03-08T12-00-00.json --output_dir path/to/lc_plots
+python3 plot_lc.py --objects_json path/to/run_dir/objs.json --alerts_json path/to/run_dir/cands.json --output_dir path/to/run_dir --output_subdir plots --include_ztf --band_rates_json path/to/run_dir/band_rates.json
 """
 
 if __name__ == "__main__":
@@ -688,6 +758,9 @@ if __name__ == "__main__":
     parser.add_argument("--output_subdir", default=None, help="Optional plot subfolder name")
     parser.add_argument("--max_objects", type=int, default=None, help="Optional maximum number of objects to plot")
     parser.add_argument("--skip_individual_plots", action="store_true", help="Only write LSST-only delta metrics; do not plot individual light curves")
+    parser.add_argument("--exclude_start_time", default=None, help="Optional UTC ISO start of the run's excluded interval, shaded on plots for reference (objects with points in it are dropped by boom_filter_per_run.py, not here)")
+    parser.add_argument("--exclude_end_time", default=None, help="Optional UTC ISO end of that interval")
+    parser.add_argument("--band_rates_json", default=None, help="Optional path to band_rates.json from boom_filter_per_run.py, for the rising/fading rate legend entries")
     args = parser.parse_args()
 
     main(
@@ -699,4 +772,7 @@ if __name__ == "__main__":
         output_subdir=args.output_subdir,
         max_objects=args.max_objects,
         make_plots=not args.skip_individual_plots,
+        exclude_start_time=args.exclude_start_time,
+        exclude_end_time=args.exclude_end_time,
+        band_rates_json=args.band_rates_json,
     )

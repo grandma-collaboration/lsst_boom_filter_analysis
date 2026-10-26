@@ -17,6 +17,7 @@ This creates one run folder inside --output_dir. The run folder contains:
     objs.json
     cands_sum.csv
     objs_sum.csv
+    band_rates.json
 """
 
 # =========================
@@ -24,6 +25,9 @@ This creates one run folder inside --output_dir. The run folder contains:
 # =========================
 
 BOOM_URL = "https://api.kaboom.caltech.edu"
+
+# Most filter-passing alerts BOOM returns for one 1-day filter query
+FILTER_QUERY_LIMIT = 10000
 
 # =========================
 # AUTH
@@ -84,11 +88,12 @@ def run_filter(token, pipeline, start_time_iso, end_time_iso):
 
     payload = {
         "pipeline": pipeline,
+        # "object_ids": ["170635513149522077"],
         "start_jd": start_jd,
         "end_jd": end_jd,
         "survey": "LSST",
         "permissions": {"LSST": []},
-        "limit": 10000,
+        "limit": FILTER_QUERY_LIMIT,
     }
 
     headers = {
@@ -165,7 +170,8 @@ def get_objects(token, objectid_list, batch_size=1000):
             "projection": {
                 "objectId": 1,                  # ID of the object
 
-                "prv_candidates.jd": 1,         # Photometry for the 5-sigma detections
+                "prv_candidates.diaSourceId": 1,         # Photometry for the 5-sigma detections
+                "prv_candidates.jd": 1,
                 "prv_candidates.magpsf": 1,
                 "prv_candidates.sigmapsf": 1,
                 "prv_candidates.band": 1,
@@ -196,6 +202,176 @@ def get_objects(token, objectid_list, batch_size=1000):
         all_results.extend(results)
 
     return all_results
+
+
+def get_last_point_ids_by_band(object_jsons):
+    """
+    For each object, find the diaSourceId of its most recent (max jd) LSST
+    detection in every band. Each LSST detection is itself an alert document
+    in LSST_alerts, and its diaSourceId doubles as that document's _id, so
+    this identifies exactly which alert to query for the rate as of that
+    specific point -- not the rate of the last point that happened to pass a
+    filter, which may be an earlier, now-stale fit.
+    """
+    last_point_by_object_band = {}
+    for obj in object_jsons:
+        obj_id = obj.get("objectId", obj.get("_id"))
+        best = {}  # band -> (jd, diaSourceId)
+        for point in as_list(obj.get("prv_candidates")):
+            band = point.get("band")
+            jd = point.get("jd")
+            dia_source_id = point.get("diaSourceId")
+            if band is None or jd is None or dia_source_id is None:
+                continue
+            current = best.get(band)
+            if current is None or jd > current[0]:
+                best[band] = (jd, dia_source_id)
+        last_point_by_object_band[obj_id] = {
+            band: dia_source_id for band, (jd, dia_source_id) in best.items()
+        }
+    return last_point_by_object_band
+
+
+def get_band_rates(token, object_jsons, batch_size=1000):
+    """
+    Fetch BOOM's rising/fading rate for the most recent LSST detection in
+    each band of each object, regardless of whether that detection ever
+    passed a filter.
+
+    LSST_alerts_aux (the source of prv_candidates/objs.json) carries only bare
+    photometry: no properties, no photstats, on the document or on any
+    individual point. The rate only exists on LSST_alerts documents -- one per
+    detection, each with a properties.photstats snapshot as of that
+    detection -- so this queries LSST_alerts directly by diaSourceId for
+    exactly the points identified by get_last_point_ids_by_band.
+    """
+    last_point_by_object_band = get_last_point_ids_by_band(object_jsons)
+
+    dia_source_id_to_keys = {}  # diaSourceId -> list of (obj_id, band)
+    for obj_id, bands in last_point_by_object_band.items():
+        for band, dia_source_id in bands.items():
+            dia_source_id_to_keys.setdefault(dia_source_id, []).append((obj_id, band))
+
+    dia_source_ids = list(dia_source_id_to_keys.keys())
+
+    url = f"{BOOM_URL}/queries/find"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    rates_by_object = {}
+    for i in range(0, len(dia_source_ids), batch_size):
+        batch_ids = dia_source_ids[i:i + batch_size]
+
+        payload = {
+            "catalog_name": "LSST_alerts",
+            "filter": {"_id": {"$in": batch_ids}},
+            "projection": {
+                "objectId": 1,
+                "candidate.band": 1,
+                "properties.photstats": 1,
+            },
+        }
+
+        print(f"Querying band-rate batch {i // batch_size + 1} ({len(batch_ids)} ids)")
+
+        response = requests.post(url, json=payload, headers=headers)
+
+        if response.status_code != 200:
+            print(response.status_code)
+            print(response.text)
+            response.raise_for_status()
+
+        for alert in response.json()["data"]:
+            dia_source_id = alert.get("_id")
+            photstats = (alert.get("properties") or {}).get("photstats") or {}
+            for obj_id, band in dia_source_id_to_keys.get(dia_source_id, []):
+                band_stats = photstats.get(band) or {}
+                rising = band_stats.get("rising") or {}
+                fading = band_stats.get("fading") or {}
+                rates_by_object.setdefault(obj_id, {})[band] = {
+                    "rising_rate": rising.get("rate"),
+                    "fading_rate": fading.get("rate"),
+                }
+
+    return rates_by_object
+
+
+# =========================
+# TOTAL COUNTS
+# =========================
+
+
+def count_documents(token, catalog_name, filter_dict):
+    """Number of documents in catalog_name matching filter_dict (BOOM /queries/count)."""
+    url = f"{BOOM_URL}/queries/count"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "catalog_name": catalog_name,
+        "filter": filter_dict,
+    }
+
+    response = requests.post(url, json=payload, headers=headers)
+
+    if response.status_code != 200:
+        print(response.status_code)
+        print(response.text)
+        response.raise_for_status()
+
+    return response.json()["data"]
+
+
+def jd_range(start_time, end_time):
+    """Mongo range on a Julian Date for the half-open UTC interval [start_time, end_time)."""
+    return {
+        "$gte": Time(start_time, scale='utc').jd,
+        "$lt": Time(end_time, scale='utc').jd,
+    }
+
+
+def build_total_count_filters(start_time, end_time, exclude_start_time=None, exclude_end_time=None):
+    """
+    Filters selecting every LSST alert and every LSST object in the queried
+    range -- the populations the filter-passing alerts and objects are drawn
+    from, so they can be turned into pass fractions:
+      - alerts (LSST_alerts): detection time in [start, end), minus the
+        alerts inside the excluded range;
+      - objects (LSST_alerts_aux): at least one detection in [start, end),
+        and no point at all -- detection or forced photometry -- in the
+        excluded range, the same rule drop_objects_with_excluded_points
+        applies to the filter-passing objects.
+    $elemMatch keeps each range on a single point, so an object with points
+    on both sides of the excluded range, but none inside it, is kept.
+    """
+    in_range = jd_range(start_time, end_time)
+    alert_conditions = [{"candidate.jd": in_range}]
+    object_conditions = [{"prv_candidates": {"$elemMatch": {"jd": in_range}}}]
+
+    if exclude_start_time and exclude_end_time:
+        excluded = jd_range(exclude_start_time, exclude_end_time)
+        alert_conditions.append({"$nor": [{"candidate.jd": excluded}]})
+        object_conditions.append({"$nor": [
+            {"prv_candidates": {"$elemMatch": {"jd": excluded}}},
+            {"fp_hists": {"$elemMatch": {"jd": excluded}}},
+        ]})
+
+    return {"$and": alert_conditions}, {"$and": object_conditions}
+
+
+def pass_fraction(n_passing, n_total):
+    return n_passing / n_total if n_total else None
+
+
+def format_pass_fraction(n_passing, n_total):
+    fraction = pass_fraction(n_passing, n_total)
+    percent = f"{100 * fraction:.3g}%" if fraction is not None else "n/a"
+    return f"{n_passing:,} / {n_total:,} ({percent})"
 
 
 # =========================
@@ -327,6 +503,54 @@ def write_candidate_summary(candidate_list, output_csv):
 
 
 
+def make_exclude_jd(exclude_start_time, exclude_end_time):
+    if not (exclude_start_time and exclude_end_time):
+        return None
+    return (
+        Time(exclude_start_time, scale='utc').jd,
+        Time(exclude_end_time, scale='utc').jd,
+    )
+
+
+def object_has_excluded_point(obj, exclude_jd):
+    """
+    True if this object has any point, in any band, in either prv_candidates
+    (LSST detections) or fp_hists (forced photometry), inside the half-open
+    excluded interval [start_jd, end_jd).
+    """
+    if exclude_jd is None:
+        return False
+    start_jd, end_jd = exclude_jd
+    for key in ("prv_candidates", "fp_hists"):
+        for point in as_list(obj.get(key)):
+            jd = point.get("jd")
+            if isinstance(jd, (int, float)) and start_jd <= jd < end_jd:
+                return True
+    return False
+
+
+def drop_objects_with_excluded_points(object_jsons, exclude_jd):
+    """
+    Drop every object that has any point in the excluded interval, instead of
+    trimming individual points. An object is either kept with its full,
+    untouched history, or left out of the run entirely -- so there is no
+    partial history left behind, and no baseline to reconcile downstream.
+    """
+    if exclude_jd is None:
+        return object_jsons, set()
+
+    kept = []
+    dropped_object_ids = set()
+    for obj in object_jsons:
+        object_id = obj.get("objectId", obj.get("_id"))
+        if object_has_excluded_point(obj, exclude_jd):
+            dropped_object_ids.add(object_id)
+        else:
+            kept.append(obj)
+    return kept, dropped_object_ids
+
+
+
 def build_object_summary(object_jsons, candidate_jsons):
     n_alerts_by_object = Counter(candidate.get("objectId") for candidate in candidate_jsons)
     rows = []
@@ -430,7 +654,7 @@ def write_object_summary(rows, fieldnames, output_csv):
 
 
 
-def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None, exclude_end_time=None):
+def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None, exclude_end_time=None, compute_pass_rates=False):
 
     print("Auth...")
     token, _ = get_token()
@@ -472,8 +696,8 @@ def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None,
             alerts = result.get("data", {}).get("results", [])
 
             print(f"  fetched {len(alerts)} alerts")
-            if len(alerts) >= 10000:
-                print("  WARNING: fetched 10000 alerts; the BOOM query limit may have truncated this batch.")
+            if len(alerts) >= FILTER_QUERY_LIMIT:
+                print(f"  WARNING: fetched {FILTER_QUERY_LIMIT} alerts; the BOOM query limit may have truncated this batch.")
 
             all_alerts.extend(alerts)
 
@@ -484,11 +708,6 @@ def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None,
     id_list = [a["_id"] for a in all_alerts]
     objectid_list = list(dict.fromkeys(a["objectId"] for a in all_alerts))
 
-    print("===================================================================")
-    print(f"                => Unique candidate IDs: {len(id_list)}")
-    print(f"                => Unique object IDs: {len(objectid_list)}")
-    print("===================================================================\n")
-
     run_dir = make_run_dir(output_dir, start_time, end_time)
     print(f"Saving this run to: {run_dir}\n")
 
@@ -496,10 +715,72 @@ def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None,
     object_jsons = get_objects(token, objectid_list)
     print("")
 
+    # An object with any point (any band, detection or forced photometry) in
+    # the excluded range is dropped entirely, along with its candidates, so
+    # this run's outputs behave as if such objects were never retrieved.
+    exclude_jd = make_exclude_jd(exclude_start_time, exclude_end_time)
+    object_jsons, dropped_object_ids = drop_objects_with_excluded_points(object_jsons, exclude_jd)
+    if dropped_object_ids:
+        candidate_jsons = [c for c in candidate_jsons if c.get("objectId") not in dropped_object_ids]
+        print(
+            f"Dropped {len(dropped_object_ids)} object(s) with photometry in the excluded range "
+            f"({exclude_start_time} to {exclude_end_time}); "
+            f"{len(object_jsons)} object(s) and {len(candidate_jsons)} candidate(s) remain\n"
+        )
+
+    # =========================
+    # PASS FRACTIONS
+    # =========================
+
+    # Alerts: the excluded range only removes the alerts inside it, which the
+    # filter never queried, so every filter-passing alert counts.
+    # Objects: objects with points in the excluded range are not in the total,
+    # so only the ones left after the drop above count.
+    n_alerts_passing = len(dict.fromkeys(id_list))
+    n_objects_passing = len(object_jsons)
+
+    filter_pass_rates = None
+    if compute_pass_rates:
+        # Every LSST alert and object in the queried range, with the excluded
+        # range applied the same way as to the filter-passing ones. The alert
+        # count is indexed; the object count scans all of LSST_alerts_aux (no
+        # index on prv_candidates.jd or fp_hists.jd), which takes about a minute.
+        alerts_total_filter, objects_total_filter = build_total_count_filters(
+            start_time, end_time, exclude_start_time, exclude_end_time
+        )
+        print("Counting every LSST alert in the queried range...")
+        n_alerts_total = count_documents(token, "LSST_alerts", alerts_total_filter)
+        print("Counting every LSST object in the queried range...")
+        n_objects_total = count_documents(token, "LSST_alerts_aux", objects_total_filter)
+
+        filter_pass_rates = {
+            "n_alerts_passing": n_alerts_passing,
+            "n_alerts_total": n_alerts_total,
+            "alert_pass_fraction": pass_fraction(n_alerts_passing, n_alerts_total),
+            "n_objects_passing": n_objects_passing,
+            "n_objects_total": n_objects_total,
+            "object_pass_fraction": pass_fraction(n_objects_passing, n_objects_total),
+            "alerts_total_count_query": {"catalog_name": "LSST_alerts", "filter": alerts_total_filter},
+            "objects_total_count_query": {"catalog_name": "LSST_alerts_aux", "filter": objects_total_filter},
+        }
+
+    print("\n===================================================================")
+    if filter_pass_rates is not None:
+        print(f"                => Filter-passing alerts:  {format_pass_fraction(n_alerts_passing, n_alerts_total)}")
+        print(f"                => Filter-passing objects: {format_pass_fraction(n_objects_passing, n_objects_total)}")
+    else:
+        print(f"                => Filter-passing alerts:  {n_alerts_passing:,}")
+        print(f"                => Filter-passing objects: {n_objects_passing:,}")
+    print("===================================================================\n")
+
+    print("Querying the latest rising/fading rate per band for each object...")
+    band_rates = get_band_rates(token, object_jsons)
+
     output_candidates_json = os.path.join(run_dir, "cands.json")
     output_objects_json = os.path.join(run_dir, "objs.json")
     output_candidates_summary = os.path.join(run_dir, "cands_sum.csv")
     output_objects_summary = os.path.join(run_dir, "objs_sum.csv")
+    output_band_rates_json = os.path.join(run_dir, "band_rates.json")
 
     # =========================
     # BUILD AND SAVE SUMMARIES
@@ -525,15 +806,22 @@ def main(output_dir, filter_file, start_time, end_time, exclude_start_time=None,
         json.dump(object_jsons, f, indent=2)
     print(f"Saved objects to {output_objects_json}")
 
+    with open(output_band_rates_json, "w") as f:
+        json.dump(band_rates, f, indent=2)
+    print(f"Saved band rates to {output_band_rates_json}")
+
     return {
         "run_dir": run_dir,
         "candidates_json": output_candidates_json,
         "objects_json": output_objects_json,
         "candidates_summary": output_candidates_summary,
         "objects_summary": output_objects_summary,
+        "band_rates_json": output_band_rates_json,
         "n_alerts": len(all_alerts),
-        "n_candidates": len(id_list),
-        "n_objects": len(objectid_list),
+        "n_candidates": len(candidate_jsons),
+        "n_objects": len(object_jsons),
+        "n_objects_dropped_excluded": len(dropped_object_ids),
+        "filter_pass_rates": filter_pass_rates,
         "exclude_start_time": exclude_start_time,
         "exclude_end_time": exclude_end_time,
         "query_intervals": [
@@ -552,8 +840,9 @@ if __name__ == "__main__":
     parser.add_argument("--filter_file", required=True, help="Path to MongoDB pipeline JSON file")
     parser.add_argument("--start_time", required=True, help="ISO time")
     parser.add_argument("--end_time", required=True, help="ISO time")
-    parser.add_argument("--exclude_start_time", default=None, help="Optional ISO start time to exclude from the query")
-    parser.add_argument("--exclude_end_time", default=None, help="Optional ISO end time to exclude from the query")
+    parser.add_argument("--exclude_start_time", default=None, help="Optional ISO start time of a range to exclude: it is not queried, and objects with any point in it are dropped")
+    parser.add_argument("--exclude_end_time", default=None, help="Optional ISO end time of the excluded range")
+    parser.add_argument("--compute_pass_rates", action="store_true", help="Also count every LSST alert/object in the range and report the filter pass fractions (adds about 2 minutes)")
 
     args = parser.parse_args()
 
@@ -564,4 +853,5 @@ if __name__ == "__main__":
         args.end_time,
         exclude_start_time=args.exclude_start_time,
         exclude_end_time=args.exclude_end_time,
+        compute_pass_rates=args.compute_pass_rates,
     )

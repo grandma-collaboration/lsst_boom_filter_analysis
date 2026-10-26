@@ -20,7 +20,7 @@ import numpy as np
 
 
 BANDS = ["u", "g", "r", "i", "z", "y"]
-DELTA_MAX_BASELINE_DAYS = 30
+DELTA_MAX_BASELINE_DAYS = 20
 
 
 def save_figure(fig, output_path):

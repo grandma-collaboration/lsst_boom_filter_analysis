@@ -70,7 +70,7 @@ def first_relative_time_range_bin_objects(delta_metric_rows):
         relative_time_range = float_or_none(row.get("delta"))
         if baseline_days is None or relative_time_range is None:
             continue
-        if baseline_days < 30 and 0 <= relative_time_range < 0.05:
+        if baseline_days < 20 and 0 <= relative_time_range < 0.05:
             matching_object_ids.append(row.get("objectId", ""))
 
     return matching_object_ids
@@ -130,7 +130,7 @@ def build_summary_markdown(n_candidates, n_objects, at_least_rows, first_bin_obj
             "",
             "## Objects In First Relative Time Range Bin",
             "",
-            "Objects listed here have `baseline_days < 30` and `relative time range of interest < 0.05`.",
+            "Objects listed here have `baseline_days < 20` and `relative time range of interest < 0.05`.",
             "",
             markdown_table(
                 ["Quantity", "Value"],

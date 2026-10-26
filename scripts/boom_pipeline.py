@@ -8,23 +8,20 @@ The pipeline:
   3. Plots LSST detections, LSST forced photometry, and optional ZTF crossmatch
      photometry into the same run directory.
 
-Example:
-  python3 boom_pipeline.py \
-    --output_dir ../boom_filter_outputs \
-    --filter_file ../filters/my_filter.json \
-    --start_time 2025-09-01T12:00:00 \
-    --end_time 2026-02-18T12:00:00
+There is no command-line interface for this entry point. Every parameter
+lives in inputs.py, which is the only file to edit before a run:
 
-  python3 boom_pipeline.py \
-    --output_dir ../boom_filter_outputs \
-    --filter_file ../filters/my_filter.json \
-    --start_time 2026-02-27T12:00:00 \
-    --end_time 2026-06-10T12:00:00
+  1. Edit scripts/inputs.py.
+  2. Run:
+       python3 scripts/boom_pipeline.py
+
+(The individual step scripts this pipeline calls -- boom_filter_per_run.py,
+plot_lc.py, population_plots.py, run_summary.py -- can still be run on their
+own from the command line with their own arguments; see their --help.)
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -33,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 from astropy.time import Time
+
+import inputs
 
 
 def iso_utc_now() -> str:
@@ -63,7 +62,7 @@ def validate_exclude_time_range(
         return
 
     if exclude_start_time is None or exclude_end_time is None:
-        raise ValueError("exclude_start_time and exclude_end_time must be provided together")
+        raise ValueError("EXCLUDE_START_TIME and EXCLUDE_END_TIME must be provided together")
 
     start = Time(start_time, scale="utc")
     end = Time(end_time, scale="utc")
@@ -71,7 +70,7 @@ def validate_exclude_time_range(
     exclude_end = Time(exclude_end_time, scale="utc")
 
     if exclude_end <= exclude_start:
-        raise ValueError("exclude_end_time must be after exclude_start_time")
+        raise ValueError("EXCLUDE_END_TIME must be after EXCLUDE_START_TIME")
 
     if exclude_start <= start and exclude_end >= end:
         raise ValueError("Excluded time range removes the entire query interval")
@@ -92,28 +91,28 @@ def write_manifest(run_dir: str | Path, manifest: dict[str, Any]) -> Path:
     return manifest_path
 
 
-def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+def run_pipeline() -> dict[str, Any]:
     if not os.environ.get("BOOM_PASSWORD"):
         raise RuntimeError("BOOM_PASSWORD environment variable not set")
-    
+
     if not os.environ.get("BOOM_USERNAME"):
         raise RuntimeError("BOOM_USERNAME environment variable not set")
 
-    filter_file = resolve_existing_file(args.filter_file, "Filter file")
-    validate_time_range(args.start_time, args.end_time)
+    filter_file = resolve_existing_file(inputs.FILTER_FILE, "FILTER_FILE")
+    validate_time_range(inputs.START_TIME, inputs.END_TIME)
     validate_exclude_time_range(
-        args.start_time,
-        args.end_time,
-        args.exclude_start_time,
-        args.exclude_end_time,
+        inputs.START_TIME,
+        inputs.END_TIME,
+        inputs.EXCLUDE_START_TIME,
+        inputs.EXCLUDE_END_TIME,
     )
-    if args.max_objects is not None and args.max_objects < 1:
-        raise ValueError("max_objects must be a positive integer")
+    if inputs.MAX_OBJECTS is not None and inputs.MAX_OBJECTS < 1:
+        raise ValueError("MAX_OBJECTS must be a positive integer")
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir = Path(inputs.OUTPUT_DIR).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Imported after validation so command-line errors stay clear and fast.
+    # Imported after validation so configuration errors stay clear and fast.
     import boom_filter_per_run
     import plot_lc
     import population_plots
@@ -123,16 +122,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     filter_result = boom_filter_per_run.main(
         str(output_dir),
         str(filter_file),
-        args.start_time,
-        args.end_time,
-        exclude_start_time=args.exclude_start_time,
-        exclude_end_time=args.exclude_end_time,
+        inputs.START_TIME,
+        inputs.END_TIME,
+        exclude_start_time=inputs.EXCLUDE_START_TIME,
+        exclude_end_time=inputs.EXCLUDE_END_TIME,
+        compute_pass_rates=inputs.COMPUTE_FILTER_PASS_RATES,
     )
 
     run_dir = Path(filter_result["run_dir"])
-    plots_subdir = validate_relative_subdir(args.plots_subdir, "plots_subdir")
+    plots_subdir = validate_relative_subdir(inputs.PLOTS_SUBDIR, "PLOTS_SUBDIR")
 
-    if args.skip_individual_plots:
+    if inputs.SKIP_INDIVIDUAL_PLOTS:
         print("\n========== LSST-only light-curve metrics ==========")
     else:
         print("\n========== Light-curve plots ==========")
@@ -140,11 +140,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         filter_result["objects_json"],
         filter_result["candidates_json"],
         str(run_dir),
-        include_ztf=not args.no_ztf,
-        include_fp=not args.no_forced_photometry,
+        include_ztf=inputs.INCLUDE_ZTF,
+        include_fp=inputs.INCLUDE_FORCED_PHOTOMETRY,
         output_subdir=plots_subdir,
-        max_objects=args.max_objects,
-        make_plots=not args.skip_individual_plots,
+        max_objects=inputs.MAX_OBJECTS,
+        make_plots=not inputs.SKIP_INDIVIDUAL_PLOTS,
+        exclude_start_time=inputs.EXCLUDE_START_TIME,
+        exclude_end_time=inputs.EXCLUDE_END_TIME,
+        band_rates_json=filter_result["band_rates_json"],
     )
 
     print("\n========== Population plots ==========")
@@ -168,15 +171,19 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "status": "complete",
         "command": {
             "filter_file": str(filter_file),
-            "start_time": args.start_time,
-            "end_time": args.end_time,
-            "exclude_start_time": args.exclude_start_time,
-            "exclude_end_time": args.exclude_end_time,
-            "include_ztf": not args.no_ztf,
-            "include_forced_photometry": not args.no_forced_photometry,
-            "max_objects": args.max_objects,
-            "skip_individual_plots": args.skip_individual_plots,
+            "start_time": inputs.START_TIME,
+            "end_time": inputs.END_TIME,
+            "exclude_start_time": inputs.EXCLUDE_START_TIME,
+            "exclude_end_time": inputs.EXCLUDE_END_TIME,
+            "include_ztf": inputs.INCLUDE_ZTF,
+            "include_forced_photometry": inputs.INCLUDE_FORCED_PHOTOMETRY,
+            "max_objects": inputs.MAX_OBJECTS,
+            "skip_individual_plots": inputs.SKIP_INDIVIDUAL_PLOTS,
+            "compute_filter_pass_rates": inputs.COMPUTE_FILTER_PASS_RATES,
         },
+        # Filter-passing alerts/objects vs. every LSST alert/object in the
+        # queried range; None unless COMPUTE_FILTER_PASS_RATES is True
+        # "filter_pass_rates": filter_result["filter_pass_rates"],
         "filter_result": filter_result,
         "plot_result": plot_result,
         "population_plot_result": population_plot_result,
@@ -185,6 +192,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "run_dir": str(run_dir),
             "candidates_json": filter_result["candidates_json"],
             "objects_json": filter_result["objects_json"],
+            "band_rates_json": filter_result["band_rates_json"],
             "candidates_summary_csv": filter_result["candidates_summary"],
             "objects_summary_csv": filter_result["objects_summary"],
             "plots_dir": plot_result["plots_dir"],
@@ -205,63 +213,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     return manifest
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run BOOM filtering and complete light-curve plotting in one command."
-    )
-    parser.add_argument(
-        "--output_dir",
-        default="boom_filter_outputs",
-        help="Base output directory. A timestamped run folder is created inside it.",
-    )
-    parser.add_argument("--filter_file", required=True, help="Path to MongoDB pipeline JSON file")
-    parser.add_argument("--start_time", required=True, help="UTC ISO start time")
-    parser.add_argument("--end_time", required=True, help="UTC ISO end time")
-    parser.add_argument(
-        "--exclude_start_time",
-        default=None,
-        help="Optional UTC ISO start time of a range to exclude from BOOM filtering.",
-    )
-    parser.add_argument(
-        "--exclude_end_time",
-        default=None,
-        help="Optional UTC ISO end time of a range to exclude from BOOM filtering.",
-    )
-    parser.add_argument(
-        "--plots_subdir",
-        default="plots",
-        help="Subdirectory inside the run folder where plots are written.",
-    )
-    parser.add_argument(
-        "--no_ztf",
-        action="store_true",
-        help="Disable ZTF cone-search crossmatch photometry in the plots.",
-    )
-    parser.add_argument(
-        "--no_forced_photometry",
-        action="store_true",
-        help="Disable LSST forced photometry in the plots.",
-    )
-    parser.add_argument(
-        "--max_objects",
-        type=int,
-        default=None,
-        help="Optional cap on the number of objects to plot, useful for smoke tests.",
-    )
-    parser.add_argument(
-        "--skip_individual_plots",
-        action="store_true",
-        help="Skip individual light-curve PNG/pickle plots while still writing LSST-only metrics, population plots, and summaries.",
-    )
-    return parser
-
-
 def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
     try:
-        manifest = run_pipeline(args)
+        manifest = run_pipeline()
     except Exception as exc:
         print(f"\nPipeline failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -272,6 +226,7 @@ def main() -> int:
     print(f"Candidate summary CSV:  {artifacts['candidates_summary_csv']}")
     print(f"Candidate JSON:         {artifacts['candidates_json']}")
     print(f"Object JSON:            {artifacts['objects_json']}")
+    print(f"Band rates JSON:        {artifacts['band_rates_json']}")
     print(f"Object summary CSV:     {artifacts['objects_summary_csv']}")
     print(f"Plots directory:        {artifacts['plots_dir']}")
     print(f"Delta metrics CSV:      {artifacts['delta_metrics_csv']}")
